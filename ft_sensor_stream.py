@@ -15,6 +15,9 @@ import threading
 import time
 from queue import Queue
 from datetime import datetime
+from collections import deque
+from typing import List, Optional
+import numpy as np
 
 import rerun as rr
 from rerun import blueprint as rrb
@@ -25,6 +28,103 @@ XYZ_AXIS_COLORS = [[231, 76, 60], [39, 174, 96], [52, 120, 219]]  # Red, Green, 
 
 # Queue for streaming data
 data_queue = Queue()
+
+# Smoothing configuration
+class SmoothingConfig:
+    """Configuration for data smoothing."""
+    def __init__(self, method: str = "moving_average", window_size: int = 5, alpha: float = 0.3):
+        self.method = method  # "moving_average", "exponential", "savgol"
+        self.window_size = window_size
+        self.alpha = alpha  # For exponential smoothing
+
+# Global smoothing state
+smoothing_config = SmoothingConfig()
+
+class DataSmoother:
+    """Handles smoothing of force and torque data."""
+    
+    def __init__(self, config: SmoothingConfig):
+        self.config = config
+        self.force_history = deque(maxlen=config.window_size)
+        self.torque_history = deque(maxlen=config.window_size)
+        self.force_ema = None
+        self.torque_ema = None
+    
+    def smooth_data(self, force: List[float], torque: List[float]) -> tuple[List[float], List[float]]:
+        """Apply smoothing to force and torque data."""
+        self.force_history.append(force)
+        self.torque_history.append(torque)
+        
+        if self.config.method == "moving_average":
+            return self._moving_average()
+        elif self.config.method == "exponential":
+            return self._exponential_smoothing(force, torque)
+        elif self.config.method == "savgol":
+            return self._savitzky_golay()
+        else:
+            return force, torque  # No smoothing
+    
+    def _moving_average(self) -> tuple[List[float], List[float]]:
+        """Apply moving average smoothing."""
+        if len(self.force_history) == 0:
+            return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+        
+        # Calculate average for each axis
+        force_avg = [0.0, 0.0, 0.0]
+        torque_avg = [0.0, 0.0, 0.0]
+        
+        for i in range(3):
+            force_avg[i] = sum(f[i] for f in self.force_history) / len(self.force_history)
+            torque_avg[i] = sum(t[i] for t in self.torque_history) / len(self.torque_history)
+        
+        return force_avg, torque_avg
+    
+    def _exponential_smoothing(self, force: List[float], torque: List[float]) -> tuple[List[float], List[float]]:
+        """Apply exponential moving average smoothing."""
+        if self.force_ema is None:
+            self.force_ema = force[:]
+            self.torque_ema = torque[:]
+            return force, torque
+        
+        # Apply EMA: new_value = alpha * current + (1-alpha) * previous
+        alpha = self.config.alpha
+        for i in range(3):
+            self.force_ema[i] = alpha * force[i] + (1 - alpha) * self.force_ema[i]
+            self.torque_ema[i] = alpha * torque[i] + (1 - alpha) * self.torque_ema[i]
+        
+        return self.force_ema[:], self.torque_ema[:]
+    
+    def _savitzky_golay(self) -> tuple[List[float], List[float]]:
+        """Apply Savitzky-Golay filter smoothing."""
+        try:
+            from scipy.signal import savgol_filter
+
+            if len(self.force_history) < 3:
+                # Not enough data for Savitzky-Golay, use moving average
+                return self._moving_average()
+            
+            # Convert to numpy arrays for filtering
+            force_array = np.array(list(self.force_history))
+            torque_array = np.array(list(self.torque_history))
+            
+            # Apply Savitzky-Golay filter
+            window_length = min(len(self.force_history), 5)
+            if window_length % 2 == 0:
+                window_length -= 1  # Must be odd
+            
+            if window_length >= 3:
+                force_smooth = savgol_filter(force_array, window_length, 2, axis=0)
+                torque_smooth = savgol_filter(torque_array, window_length, 2, axis=0)
+                return force_smooth[-1].tolist(), torque_smooth[-1].tolist()
+            else:
+                return self._moving_average()
+                
+        except ImportError:
+            print("Warning: scipy not available, falling back to moving average")
+            return self._moving_average()
+
+# Global smoother instance
+data_smoother = DataSmoother(smoothing_config)
 
 # Pattern to parse the streaming data
 # F:  99Hz | Force: [   0.02,    0.14,   -0.11] N | Torque: [ 0.000, -0.000, -0.001] Nm
@@ -89,9 +189,42 @@ def main() -> None:
         action="store_true",
         help="Start web viewer server",
     )
+    parser.add_argument(
+        "--smoothing",
+        type=str,
+        choices=["none", "moving_average", "exponential", "savgol"],
+        default="moving_average",
+        help="Smoothing method to apply to the data (default: moving_average)",
+    )
+    parser.add_argument(
+        "--smoothing-window",
+        type=int,
+        default=5,
+        help="Window size for moving average and Savitzky-Golay smoothing (default: 5)",
+    )
+    parser.add_argument(
+        "--smoothing-alpha",
+        type=float,
+        default=0.3,
+        help="Alpha parameter for exponential smoothing (0-1, default: 0.3)",
+    )
     rr.script_add_args(parser)
     args = parser.parse_args()
-    # Create blueprint with force and torque plots
+    
+    # Configure smoothing based on arguments
+    global smoothing_config, data_smoother
+    if args.smoothing != "none":
+        smoothing_config = SmoothingConfig(
+            method=args.smoothing,
+            window_size=args.smoothing_window,
+            alpha=args.smoothing_alpha
+        )
+        data_smoother = DataSmoother(smoothing_config)
+        print(f"Smoothing enabled: {args.smoothing} (window={args.smoothing_window}, alpha={args.smoothing_alpha})")
+    else:
+        print("Smoothing disabled")
+    
+    # Create blueprint with force and torque plots (both raw and smoothed)
     blueprint = rrb.Vertical(
         rrb.TimeSeriesView(
             origin="force",
@@ -105,7 +238,10 @@ def main() -> None:
                 ),
             ],
             overrides={
-                "/force": rr.SeriesLines.from_fields(
+                "/force/raw": rr.SeriesLines.from_fields(
+                    names=XYZ_AXIS_NAMES, colors=[[200, 200, 200], [180, 180, 180], [160, 160, 160]]
+                ),
+                "/force/smoothed": rr.SeriesLines.from_fields(
                     names=XYZ_AXIS_NAMES, colors=XYZ_AXIS_COLORS
                 ),
             },
@@ -122,7 +258,10 @@ def main() -> None:
                 ),
             ],
             overrides={
-                "/torque": rr.SeriesLines.from_fields(
+                "/torque/raw": rr.SeriesLines.from_fields(
+                    names=XYZ_AXIS_NAMES, colors=[[200, 200, 200], [180, 180, 180], [160, 160, 160]]
+                ),
+                "/torque/smoothed": rr.SeriesLines.from_fields(
                     names=XYZ_AXIS_NAMES, colors=XYZ_AXIS_COLORS
                 ),
             },
@@ -182,13 +321,31 @@ def _log_streaming_data(max_duration_sec: float) -> None:
             timestamp = data["timestamp"]
             rr.set_time("timestamp", timestamp=timestamp)
 
-            # Log force data
-            force = data["force"]
-            rr.log("/force", rr.Scalars(force))
+            # Get raw force and torque data
+            force_raw = data["force"]
+            torque_raw = data["torque"]
 
-            # Log torque data
-            torque = data["torque"]
-            rr.log("/torque", rr.Scalars(torque))
+            # Apply smoothing if enabled
+            if smoothing_config.method != "none":
+                force_smooth, torque_smooth = data_smoother.smooth_data(force_raw, torque_raw)
+                
+                # Log both raw and smoothed data
+                rr.log("/force/raw", rr.Scalars(force_raw))
+                rr.log("/force/smoothed", rr.Scalars(force_smooth))
+                rr.log("/torque/raw", rr.Scalars(torque_raw))
+                rr.log("/torque/smoothed", rr.Scalars(torque_smooth))
+                
+                # Use smoothed data for statistics
+                force = force_smooth
+                torque = torque_smooth
+            else:
+                # Log only raw data when smoothing is disabled
+                rr.log("/force/raw", rr.Scalars(force_raw))
+                rr.log("/torque/raw", rr.Scalars(torque_raw))
+                
+                # Use raw data for statistics
+                force = force_raw
+                torque = torque_raw
 
             # Log frequency data
             frequency = data["frequency"]
