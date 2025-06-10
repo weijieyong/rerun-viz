@@ -230,10 +230,10 @@ def main() -> None:
             origin="force",
             name="Force (N)",
             time_ranges=[
-                # Sliding window showing last 100 samples for real-time visualization
+                # Sliding window showing last 5 seconds for real-time visualization
                 rrb.VisibleTimeRange(
                     "timestamp",
-                    start=rrb.TimeRangeBoundary.cursor_relative(seconds=-10.0),
+                    start=rrb.TimeRangeBoundary.cursor_relative(seconds=-5.0),
                     end=rrb.TimeRangeBoundary.cursor_relative(),
                 ),
             ],
@@ -250,10 +250,10 @@ def main() -> None:
             origin="torque",
             name="Torque (Nm)",
             time_ranges=[
-                # Sliding window showing last 100 samples for real-time visualization
+                # Sliding window showing last 5 seconds for real-time visualization
                 rrb.VisibleTimeRange(
                     "timestamp",
-                    start=rrb.TimeRangeBoundary.cursor_relative(seconds=-10.0),
+                    start=rrb.TimeRangeBoundary.cursor_relative(seconds=-5.0),
                     end=rrb.TimeRangeBoundary.cursor_relative(),
                 ),
             ],
